@@ -1,0 +1,18 @@
+version: "3"
+
+vars:
+  STORAGE_PATH: "./storage/sso.db"
+  MIGRATIONS_PATH: "./migrations"
+  ENV: "development"
+
+tasks:
+  migrate:
+    desc: "Apply database migrations"
+    cmds:
+      - echo "Applying migrations..."
+      - go run ./cmd/migrator --storage-path={{.STORAGE_PATH}} --migrations-path={{.MIGRATIONS_PATH}}
+  run:
+    desc: "Run the SSO server"
+    cmds:
+      - echo "Starting SSO server..."
+      - go run ./cmd/sso/main.go -config ./config/local.yaml
