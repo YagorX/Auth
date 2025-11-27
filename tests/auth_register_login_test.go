@@ -130,6 +130,37 @@ func TestRegister_FailCases(t *testing.T) {
 	}
 }
 
+func Test_IsAdmin(t *testing.T) {
+	ctx, st := suite.New(t)
+
+	tests := []struct {
+		nameTest    string
+		userID      int64
+		expectedVal bool
+	}{
+		{
+			nameTest:    "First test",
+			userID:      1,
+			expectedVal: false,
+		},
+		// {
+		// 	nameTest:    "Second test",
+		// 	userID:      15,
+		// 	expectedVal: true,
+		// },
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.nameTest, func(t *testing.T) {
+			isAdmin, err := st.AuthClient.IsAdmin(ctx, &ssov1.IsAdminRequest{
+				UserId: tt.userID,
+			})
+			require.NoError(t, err)
+			require.Contains(t, isAdmin.GetIsAdmin(), tt.expectedVal)
+		})
+	}
+}
+
 func TestLogin_FailCases(t *testing.T) {
 	ctx, st := suite.New(t)
 

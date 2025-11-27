@@ -18,12 +18,14 @@ func New(
 	storagePath string,
 	tokenTTL time.Duration,
 ) *App {
-	storage, err := sqlite.New(storagePath)
+	storage, err := sqlite.New(storagePath, log)
 	if err != nil {
 		panic(err)
 	}
 
-	authService := auth.New(log, storage, storage, storage, tokenTTL)
+	jwtAdapter := auth.NewJWTAdapter(storage)
+
+	authService := auth.New(log, storage, storage, storage, jwtAdapter, tokenTTL)
 
 	grpcApp := grpcapp.New(log, authService, grpcPort)
 

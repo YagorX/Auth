@@ -22,6 +22,7 @@ type Auth struct {
 	userSaver    UserSaver
 	userProvider UserProvider
 	appProvider  AppProvider
+	tokenManager TokenManager
 	log          *slog.Logger
 	tokenTTL     time.Duration
 }
@@ -39,6 +40,12 @@ type UserSaver interface {
 type UserProvider interface {
 	User(ctx context.Context, email string) (models.User, error)
 	IsAdmin(ctx context.Context, userID int64) (bool, error)
+	UserByID(ctx context.Context, userID int64) (models.User, error)
+}
+
+type TokenManager interface {
+	CreateToken(userID int64, appID int64, ttl time.Duration) (string, error)
+	ParseToken(token string, appID int64) (int64, error)
 }
 
 type AppProvider interface {
@@ -50,6 +57,7 @@ var (
 	ErrInvalidateAppID    = errors.New("invalidate appID")
 	ErrUserExist          = errors.New("user already exists")
 	ErrUserNotFound       = errors.New("user not found")
+	ErrInvalidToken       = errors.New("invalid token")
 )
 
 // New returns s new instance of the Auth service.
@@ -58,12 +66,14 @@ func New(
 	userSaver UserSaver,
 	userProvider UserProvider,
 	appProvider AppProvider,
+	tokenManager TokenManager,
 	tokenTTL time.Duration,
 ) *Auth {
 	return &Auth{
 		userSaver:    userSaver,
 		userProvider: userProvider,
 		appProvider:  appProvider,
+		tokenManager: tokenManager,
 		log:          log,
 		tokenTTL:     tokenTTL,
 	}
@@ -113,6 +123,7 @@ func (a *Auth) Login(
 	a.log.Info("user logger is succesful")
 
 	token, err := jwt.NewToken(user, app, a.tokenTTL)
+	// token, err := a.tokenManager.CreateToken(user.ID, int64(app.ID), a.tokenTTL)
 	if err != nil {
 		a.log.Error("error with generate token", sl.Err(err))
 		return "", fmt.Errorf("%s %w", op, err)
@@ -174,7 +185,7 @@ func (a *Auth) IsAdmin(ctx context.Context, userID int64) (bool, error) {
 		if errors.Is(err, storage.ErrUserNotFound) {
 			// если человек ввел логин неверный или пароль
 			a.log.Warn("user not found", sl.Err(err))
-			return false, fmt.Errorf("%s %w", op, ErrInvalidCredentials)
+			return false, fmt.Errorf("%s %w", op, ErrUserNotFound)
 		}
 		return false, fmt.Errorf("%s %w", op, err)
 	}
@@ -182,4 +193,19 @@ func (a *Auth) IsAdmin(ctx context.Context, userID int64) (bool, error) {
 	log.Info("checking if user is admin", slog.Bool("isAdmin", isAsdmin))
 
 	return isAsdmin, nil
+}
+
+func (a *Auth) ValidateToken(ctx context.Context, token string, appID int64) (int64, error) {
+	userID, err := a.tokenManager.ParseToken(token, appID)
+	if err != nil {
+		return 0, ErrInvalidToken
+	}
+
+	// Проверяем что пользователь существует
+	_, err = a.userProvider.UserByID(ctx, userID)
+	if err != nil {
+		return 0, ErrUserNotFound
+	}
+
+	return userID, nil
 }
