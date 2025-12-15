@@ -3,7 +3,7 @@ module sso
 go 1.24.1
 
 require (
-	github.com/YagorX/protos v0.0.0-20251002153106-64ece7fa97c9
+	github.com/YagorX/protos v0.0.0-20251215223024-0618c107749b
 	github.com/brianvoe/gofakeit/v6 v6.28.0
 	github.com/fatih/color v1.18.0
 	github.com/golang-jwt/jwt/v5 v5.3.0

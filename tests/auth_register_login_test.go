@@ -43,7 +43,7 @@ func TestRegisterLogin_Login_HappyPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	token := respLogin.GetToken()
+	token := respLogin.GetAccessToken()
 	require.NotEmpty(t, token)
 
 	loginTime := time.Now()

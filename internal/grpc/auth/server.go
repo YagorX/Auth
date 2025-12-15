@@ -17,7 +17,7 @@ type Auth interface {
 		email string,
 		password string,
 		appID int,
-	) (token string, err error)
+	) (refreshToken, accessToken string, err error)
 
 	RegisterNewUser(
 		ctx context.Context,
@@ -45,12 +45,11 @@ func Register(gRPC *grpc.Server, auth Auth) {
 func (s *serverAPI) Login(ctx context.Context,
 	req *ssov1.LoginRequest,
 ) (*ssov1.LoginResponse, error) {
-
 	if err := ValidateLogin(req); err != nil {
 		return nil, err
 	}
 
-	token, err := s.auth.Login(ctx, req.GetEmail(), req.GetPassword(), int(req.GetAppId()))
+	refresh_token, access_token, err := s.auth.Login(ctx, req.GetEmail(), req.GetPassword(), int(req.GetAppId()))
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidCredentials) {
 			return nil, status.Error(codes.InvalidArgument, "invalid email or password")
@@ -60,7 +59,8 @@ func (s *serverAPI) Login(ctx context.Context,
 	}
 
 	return &ssov1.LoginResponse{
-		Token: token,
+		AccessToken:  access_token,
+		RefreshToken: refresh_token,
 	}, nil
 }
 

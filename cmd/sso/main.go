@@ -29,7 +29,7 @@ func main() {
 
 	// TODO: инициализировать приложение (app)
 
-	application := app.New(log, cfg.GRPC.Port, cfg.Storage_path, cfg.Token_ttl)
+	application := app.New(log, cfg.GRPC.Port, cfg.Storage_path, cfg.Token_ttl, cfg.RefreshTTL)
 
 	log.Info("staritng application", slog.Any("config", cfg))
 

@@ -19,12 +19,17 @@ import (
 // всё это сделано для того чтобы наши heandlers не работали напрямую с бд
 
 type Auth struct {
-	userSaver    UserSaver
-	userProvider UserProvider
-	appProvider  AppProvider
-	tokenManager TokenManager
-	log          *slog.Logger
-	tokenTTL     time.Duration
+	userSaver       UserSaver
+	refreshSaver    RefreshSessionSaver
+	userProvider    UserProvider
+	appProvider     AppProvider
+	tokenManager    TokenManager
+	refreshProvider RefreshSessionProvider
+	refreshRotator  RefreshSessionRotator
+	refreshRevoker  RefreshSessionRevoker
+	log             *slog.Logger
+	tokenTTL        time.Duration
+	refreshTTL      time.Duration
 }
 
 // type Storage interface{} разделим на конкретные
@@ -52,6 +57,22 @@ type AppProvider interface {
 	App(ctx context.Context, appID int64) (models.App, error)
 }
 
+type RefreshSessionProvider interface {
+	RefreshSessionByHash(ctx context.Context, hash string) (models.RefreshSession, error)
+}
+
+type RefreshSessionSaver interface {
+	SaveRefreshSession(ctx context.Context, userID int64, refreshHash string, expiresAt time.Time) error
+}
+
+type RefreshSessionRotator interface {
+	RotateRefreshSession(ctx context.Context, oldHash, newHash string, newExpiresAt time.Time) error
+}
+
+type RefreshSessionRevoker interface {
+	RevokeRefreshSession(ctx context.Context, hash string) error
+}
+
 var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrInvalidateAppID    = errors.New("invalidate appID")
@@ -68,6 +89,7 @@ func New(
 	appProvider AppProvider,
 	tokenManager TokenManager,
 	tokenTTL time.Duration,
+	refreshTTL time.Duration,
 ) *Auth {
 	return &Auth{
 		userSaver:    userSaver,
@@ -76,6 +98,7 @@ func New(
 		tokenManager: tokenManager,
 		log:          log,
 		tokenTTL:     tokenTTL,
+		refreshTTL:   refreshTTL,
 	}
 }
 
@@ -87,7 +110,7 @@ func (a *Auth) Login(
 	email string,
 	password string,
 	appID int,
-) (string, error) {
+) (refreshToken, accessToken string, err error) {
 	const op = "auth.Login"
 
 	log := a.log.With(
@@ -101,35 +124,49 @@ func (a *Auth) Login(
 		if errors.Is(err, storage.ErrUserNotFound) {
 			// если человек ввел логин неверный или пароль
 			a.log.Warn("user not found", sl.Err(err))
-			return "", fmt.Errorf("%s %w", op, ErrInvalidCredentials)
+			return "", "", fmt.Errorf("%s %w", op, ErrInvalidCredentials)
 		}
 
 		a.log.Error("failed to get user", sl.Err(err))
-		return "", fmt.Errorf("%s %w", op, err)
+		return "", "", fmt.Errorf("%s %w", op, err)
 	}
 
 	if err := bcrypt.CompareHashAndPassword(user.PassHash, []byte(password)); err != nil {
 		//если не верный пароль
 		a.log.Info("invalid credentials", sl.Err(err))
-		return "", fmt.Errorf("%s %w", op, ErrInvalidCredentials)
+		return "", "", fmt.Errorf("%s %w", op, ErrInvalidCredentials)
 	}
 
 	// открываем приложение в котором секретный ключь
 	app, err := a.appProvider.App(ctx, int64(appID))
 	if err != nil {
-		return "", fmt.Errorf("%s %w", op, err)
+		return "", "", fmt.Errorf("%s %w", op, err)
 	}
 
 	a.log.Info("user logger is succesful")
-
-	token, err := jwt.NewToken(user, app, a.tokenTTL)
+	//создание токенов refresh + access(это уже есть снизу)
+	tokenAccess, err := jwt.NewToken(user, app, a.tokenTTL)
 	// token, err := a.tokenManager.CreateToken(user.ID, int64(app.ID), a.tokenTTL)
 	if err != nil {
 		a.log.Error("error with generate token", sl.Err(err))
-		return "", fmt.Errorf("%s %w", op, err)
+		return "", "", fmt.Errorf("%s %w", op, err)
 	}
 
-	return token, nil
+	refreshRaw, err := newRefreshToken(64) // 64 bytes -> длинная строка
+	if err != nil {
+		a.log.Error("error with generate refresh token", sl.Err(err))
+		return "", "", fmt.Errorf("%s %w", op, err)
+	}
+
+	refreshHash := sha256Hex(refreshRaw)
+	refreshExp := time.Now().Add(a.refreshTTL)
+
+	if err := a.refreshSaver.SaveRefreshSession(ctx, user.ID, refreshHash, refreshExp); err != nil {
+		a.log.Error("failed to save refresh session", sl.Err(err))
+		return "", "", fmt.Errorf("%s %w", op, err)
+	}
+
+	return tokenAccess, refreshRaw, nil
 }
 
 // RegisterNewUser registers new user in the system and return ID.

@@ -26,7 +26,7 @@ func main() {
 	client := ssov1.NewAuthClient(conn)
 
 	// Вызов метода IsAdmin
-	response, err := callIsAdmin(client, 15)
+	response, err := callIsAdmin(client, 12)
 	if err != nil {
 		log.Fatalf("failed to call IsAdmin: %v", err)
 	}
