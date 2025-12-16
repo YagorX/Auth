@@ -26,7 +26,7 @@ func New(
 
 	jwtAdapter := auth.NewJWTAdapter(storage)
 
-	authService := auth.New(log, storage, storage, storage, jwtAdapter, tokenTTL, refreshTTL)
+	authService := auth.New(log, storage, storage, storage, jwtAdapter, tokenTTL, refreshTTL, storage, storage, storage, storage)
 
 	grpcApp := grpcapp.New(log, authService, grpcPort)
 

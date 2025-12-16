@@ -59,8 +59,8 @@ func (s *serverAPI) Login(ctx context.Context,
 	}
 
 	return &ssov1.LoginResponse{
-		AccessToken:  access_token,
 		RefreshToken: refresh_token,
+		AccessToken:  access_token,
 	}, nil
 }
 

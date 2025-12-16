@@ -90,15 +90,23 @@ func New(
 	tokenManager TokenManager,
 	tokenTTL time.Duration,
 	refreshTTL time.Duration,
+	refreshProvider RefreshSessionProvider,
+	refreshRotator RefreshSessionRotator,
+	resreshRevoker RefreshSessionRevoker,
+	refreshSaver RefreshSessionSaver,
 ) *Auth {
 	return &Auth{
-		userSaver:    userSaver,
-		userProvider: userProvider,
-		appProvider:  appProvider,
-		tokenManager: tokenManager,
-		log:          log,
-		tokenTTL:     tokenTTL,
-		refreshTTL:   refreshTTL,
+		userSaver:       userSaver,
+		userProvider:    userProvider,
+		appProvider:     appProvider,
+		tokenManager:    tokenManager,
+		log:             log,
+		tokenTTL:        tokenTTL,
+		refreshTTL:      refreshTTL,
+		refreshProvider: refreshProvider,
+		refreshRotator:  refreshRotator,
+		refreshRevoker:  resreshRevoker,
+		refreshSaver:    refreshSaver,
 	}
 }
 
@@ -166,7 +174,7 @@ func (a *Auth) Login(
 		return "", "", fmt.Errorf("%s %w", op, err)
 	}
 
-	return tokenAccess, refreshRaw, nil
+	return refreshRaw, tokenAccess, nil
 }
 
 // RegisterNewUser registers new user in the system and return ID.

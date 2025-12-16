@@ -100,7 +100,7 @@ func (s *Storage) SaveRefreshSession(
 	return nil
 }
 
-func (s *Storage) GetRefreshSessionByHash(ctx context.Context, hash string) (models.RefreshSession, error) {
+func (s *Storage) RefreshSessionByHash(ctx context.Context, hash string) (models.RefreshSession, error) {
 	const op = "storage.sqlite.GetRefreshSessionByHash"
 
 	stmt, err := s.db.Prepare(`
