@@ -9,56 +9,58 @@ import (
 )
 
 type Config struct {
-	Env          string        `yaml:"env" env-default:"local"`
-	Storage_path string        `yaml:"storage_path" env-required:"true"`
-	Token_ttl    time.Duration `yaml:"token_ttl" env-default:"1h"`
-	RefreshTTL   time.Duration `yaml:"refreshTTL" env-default:"168h"`
-	GRPC         GRPCConfig    `yaml:"grpc"`
+	Env         string        `yaml:"env" env-default:"local"`
+	PostgresDSN string        `yaml:"storage_path" env:"POSTGRES_DSN" env-required:"true"`
+	TokenTTL    time.Duration `yaml:"token_ttl" env-default:"1h"`
+	RefreshTTL  time.Duration `yaml:"refreshTTL" env-default:"168h"`
+	GRPC        GRPCConfig    `yaml:"grpc"`
 }
 
 type GRPCConfig struct {
-	Port    int           `yaml:"port"`
-	Timeout time.Duration `yaml:"timeout"`
+	Port    int           `yaml:"port" env-default:"44044"`
+	Timeout time.Duration `yaml:"timeout" env-default:"5s"`
 }
 
-// парсит и возвращает объект конфига
-func MustLoadByPath(configPath string) *Config {
-
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		panic("config file does not exist: " + configPath)
-	}
-
-	var cfg Config
-
-	if err := cleanenv.ReadConfig(configPath, &cfg); err != nil {
-		panic("failed tp read config: " + err.Error())
-	}
-
-	return &cfg
-}
-
-// парсит и возвращает объект конфига
+// MustLoad загружает конфиг (panic — осознанно, это bootstrap)
 func MustLoad() *Config {
 	path := fetchConfigPath()
 	if path == "" {
 		panic("config path is empty")
 	}
 
-	return MustLoadByPath(path)
+	return mustLoadByPath(path)
 }
 
-// получает информацию о пути до файла конфига
-// из двух источников либо из переменных окружения
-// либо из флага (приоритет)
-func fetchConfigPath() string {
-	var res string
-
-	flag.StringVar(&res, "config", "", "path to config file")
-	flag.Parse()
-
-	if res == "" {
-		res = os.Getenv("CONFIG_PATH")
+func mustLoadByPath(path string) *Config {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		panic("config file does not exist: " + path)
 	}
 
-	return res
+	var cfg Config
+	if err := cleanenv.ReadConfig(path, &cfg); err != nil {
+		panic("failed to read config: " + err.Error())
+	}
+
+	return &cfg
+}
+
+// fetchConfigPath:
+// 1. флаг --config
+// 2. ENV CONFIG_PATH
+func fetchConfigPath() string {
+	var path string
+
+	flag.StringVar(&path, "config", "", "path to config file")
+	flag.Parse()
+
+	if path == "" {
+		path = os.Getenv("CONFIG_PATH")
+	}
+
+	return path
+}
+
+// MustLoadByPath загружает конфиг по явному пути
+func MustLoadByPath(path string) *Config {
+	return mustLoadByPath(path)
 }

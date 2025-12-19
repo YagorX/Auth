@@ -5,32 +5,29 @@ import (
 	"flag"
 	"fmt"
 
-	// Библиотека для миграций
 	"github.com/golang-migrate/migrate/v4"
-	// Драйвера для выполнения миграций
-	_ "github.com/golang-migrate/migrate/v4/database/sqlite3"
-	// Драйвера для получения миграций
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
 func main() {
-	var storagePath, migrationsPath, migrationsTable string
+	var dsn, migrationsPath, migrationsTable string
 
-	flag.StringVar(&storagePath, "storage-path", "", "path to storage")
+	flag.StringVar(&dsn, "dsn", "", "postgres DSN, e.g. postgres://user:pass@localhost:5432/authdb?sslmode=disable")
 	flag.StringVar(&migrationsPath, "migrations-path", "", "path to migrations")
-	flag.StringVar(&migrationsTable, "migrations-table", "migrations", "name of migrations table")
+	flag.StringVar(&migrationsTable, "migrations-table", "schema_migrations", "name of migrations table")
 	flag.Parse()
 
-	if storagePath == "" {
-		panic("storage path is required")
+	if dsn == "" {
+		panic("dsn is required")
 	}
 	if migrationsPath == "" {
-		panic("migration path is required")
+		panic("migrations-path is required")
 	}
 
 	m, err := migrate.New(
 		"file://"+migrationsPath,
-		fmt.Sprintf("sqlite3://%s?x-migrations-table=%s", storagePath, migrationsTable),
+		fmt.Sprintf("%s&x-migrations-table=%s", dsn, migrationsTable),
 	)
 	if err != nil {
 		panic(err)
@@ -39,10 +36,8 @@ func main() {
 	if err := m.Up(); err != nil {
 		if errors.Is(err, migrate.ErrNoChange) {
 			fmt.Println("no migrations to apply")
-
 			return
 		}
-
 		panic(err)
 	}
 

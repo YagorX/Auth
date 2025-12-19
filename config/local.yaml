@@ -1,5 +1,5 @@
-env: "local" 
-storage_path: "./storage/sso.db"
+env: local
+storage_path: "postgres://postgres:postgres@localhost:5454/authdb?sslmode=disable"
 token_ttl: 1h
 refreshTTL: 168h
 grpc:

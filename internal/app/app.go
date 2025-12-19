@@ -2,10 +2,11 @@ package app
 
 import (
 	"log/slog"
+	"time"
+
 	grpcapp "sso/internal/app/grpc"
 	"sso/internal/services/auth"
-	"sso/internal/storage/sqlite"
-	"time"
+	"sso/internal/storage/postgres"
 )
 
 type App struct {
@@ -15,22 +16,32 @@ type App struct {
 func New(
 	log *slog.Logger,
 	grpcPort int,
-	storagePath string,
+	postgresDSN string,
 	tokenTTL time.Duration,
 	refreshTTL time.Duration,
 ) *App {
-	storage, err := sqlite.New(storagePath, log)
+	storage, err := postgres.New(postgresDSN, log)
 	if err != nil {
 		panic(err)
 	}
 
 	jwtAdapter := auth.NewJWTAdapter(storage)
 
-	authService := auth.New(log, storage, storage, storage, jwtAdapter, tokenTTL, refreshTTL, storage, storage, storage, storage)
+	authService := auth.New(
+		log,
+		storage,    // UserSaver
+		storage,    // UserProvider
+		storage,    // AppProvider
+		jwtAdapter, // TokenManager
+		tokenTTL,
+		refreshTTL,
+		storage, // RefreshSessionSaver
+		storage, // RefreshSessionProvider
+		storage, // RefreshSessionRotator
+		storage, // RefreshSessionRevoker
+	)
 
 	grpcApp := grpcapp.New(log, authService, grpcPort)
 
-	return &App{
-		GRPCServer: grpcApp,
-	}
+	return &App{GRPCServer: grpcApp}
 }

@@ -5,25 +5,23 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
+
+	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+
 	"sso/internal/domain/models"
 	"sso/internal/lib/jwt"
 	"sso/internal/lib/logger/sl"
 	"sso/internal/storage"
-	"time"
-
-	"golang.org/x/crypto/bcrypt"
 )
-
-// сервисный слой будет отвечать за бизнес логику, то есть выполнять действия и бьудет взаиможейстоввать с базой данных
-// для того чтобы передавать данные между сервисным слоем и слоем работы с данными заведем моедльки (в пакете domain)
-// всё это сделано для того чтобы наши heandlers не работали напрямую с бд
 
 type Auth struct {
 	userSaver       UserSaver
-	refreshSaver    RefreshSessionSaver
 	userProvider    UserProvider
 	appProvider     AppProvider
 	tokenManager    TokenManager
+	refreshSaver    RefreshSessionSaver
 	refreshProvider RefreshSessionProvider
 	refreshRotator  RefreshSessionRotator
 	refreshRevoker  RefreshSessionRevoker
@@ -32,37 +30,31 @@ type Auth struct {
 	refreshTTL      time.Duration
 }
 
-// type Storage interface{} разделим на конкретные
-
 type UserSaver interface {
-	SaveUser(
-		ctx context.Context,
-		email string,
-		passHash []byte,
-	) (uid int64, err error)
+	SaveUser(ctx context.Context, username, email string, passHash []byte) (uuid.UUID, error)
 }
 
 type UserProvider interface {
 	User(ctx context.Context, email string) (models.User, error)
-	IsAdmin(ctx context.Context, userID int64) (bool, error)
-	UserByID(ctx context.Context, userID int64) (models.User, error)
+	UserByUUID(ctx context.Context, userUUID uuid.UUID) (models.User, error)
+	IsAdminByUUID(ctx context.Context, userUUID uuid.UUID) (bool, error)
 }
 
 type TokenManager interface {
-	CreateToken(userID int64, appID int64, ttl time.Duration) (string, error)
-	ParseToken(token string, appID int64) (int64, error)
+	CreateToken(userUUID uuid.UUID, appID int64, ttl time.Duration) (string, error)
+	ParseToken(token string, appID int64) (uuid.UUID, error)
 }
 
 type AppProvider interface {
 	App(ctx context.Context, appID int64) (models.App, error)
 }
 
-type RefreshSessionProvider interface {
-	RefreshSessionByHash(ctx context.Context, hash string) (models.RefreshSession, error)
+type RefreshSessionSaver interface {
+	SaveRefreshSession(ctx context.Context, userUUID uuid.UUID, refreshHash string, expiresAt time.Time) error
 }
 
-type RefreshSessionSaver interface {
-	SaveRefreshSession(ctx context.Context, userID int64, refreshHash string, expiresAt time.Time) error
+type RefreshSessionProvider interface {
+	RefreshSessionByHash(ctx context.Context, hash string) (models.RefreshSession, error)
 }
 
 type RefreshSessionRotator interface {
@@ -73,15 +65,6 @@ type RefreshSessionRevoker interface {
 	RevokeRefreshSession(ctx context.Context, hash string) error
 }
 
-var (
-	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrInvalidateAppID    = errors.New("invalidate appID")
-	ErrUserExist          = errors.New("user already exists")
-	ErrUserNotFound       = errors.New("user not found")
-	ErrInvalidToken       = errors.New("invalid token")
-)
-
-// New returns s new instance of the Auth service.
 func New(
 	log *slog.Logger,
 	userSaver UserSaver,
@@ -90,167 +73,175 @@ func New(
 	tokenManager TokenManager,
 	tokenTTL time.Duration,
 	refreshTTL time.Duration,
+	refreshSaver RefreshSessionSaver,
 	refreshProvider RefreshSessionProvider,
 	refreshRotator RefreshSessionRotator,
-	resreshRevoker RefreshSessionRevoker,
-	refreshSaver RefreshSessionSaver,
+	refreshRevoker RefreshSessionRevoker,
 ) *Auth {
 	return &Auth{
 		userSaver:       userSaver,
 		userProvider:    userProvider,
 		appProvider:     appProvider,
 		tokenManager:    tokenManager,
+		refreshSaver:    refreshSaver,
+		refreshProvider: refreshProvider,
+		refreshRotator:  refreshRotator,
+		refreshRevoker:  refreshRevoker,
 		log:             log,
 		tokenTTL:        tokenTTL,
 		refreshTTL:      refreshTTL,
-		refreshProvider: refreshProvider,
-		refreshRotator:  refreshRotator,
-		refreshRevoker:  resreshRevoker,
-		refreshSaver:    refreshSaver,
 	}
 }
 
-// login check if user with given credentials exists in the system
-// If user exists, but password is incorrect, return error
-// if user doesnot exist, return error
-func (a *Auth) Login(
-	ctx context.Context,
-	email string,
-	password string,
-	appID int,
-) (refreshToken, accessToken string, err error) {
-	const op = "auth.Login"
+/*
+====================
+Auth methods
+====================
+*/
 
-	log := a.log.With(
-		slog.String("op", op),
-		slog.String("email", email), // так себе практика
-	)
-	log.Info("login user")
+func (a *Auth) Login(ctx context.Context, email, password string, appID int) (refreshToken, accessToken string, err error) {
+	const op = "auth.Login"
 
 	user, err := a.userProvider.User(ctx, email)
 	if err != nil {
 		if errors.Is(err, storage.ErrUserNotFound) {
-			// если человек ввел логин неверный или пароль
-			a.log.Warn("user not found", sl.Err(err))
-			return "", "", fmt.Errorf("%s %w", op, ErrInvalidCredentials)
+			return "", "", fmt.Errorf("%s: %w", op, storage.ErrInvalidCredentials)
 		}
-
-		a.log.Error("failed to get user", sl.Err(err))
-		return "", "", fmt.Errorf("%s %w", op, err)
+		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
-	if err := bcrypt.CompareHashAndPassword(user.PassHash, []byte(password)); err != nil {
-		//если не верный пароль
-		a.log.Info("invalid credentials", sl.Err(err))
-		return "", "", fmt.Errorf("%s %w", op, ErrInvalidCredentials)
+	if err := bcrypt.CompareHashAndPassword(user.PasswordHash, []byte(password)); err != nil {
+		return "", "", fmt.Errorf("%s: %w", op, storage.ErrInvalidCredentials)
 	}
 
-	// открываем приложение в котором секретный ключь
 	app, err := a.appProvider.App(ctx, int64(appID))
 	if err != nil {
-		return "", "", fmt.Errorf("%s %w", op, err)
+		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
-	a.log.Info("user logger is succesful")
-	//создание токенов refresh + access(это уже есть снизу)
-	tokenAccess, err := jwt.NewToken(user, app, a.tokenTTL)
-	// token, err := a.tokenManager.CreateToken(user.ID, int64(app.ID), a.tokenTTL)
+	access, err := jwt.NewToken(user, app, a.tokenTTL)
 	if err != nil {
-		a.log.Error("error with generate token", sl.Err(err))
-		return "", "", fmt.Errorf("%s %w", op, err)
+		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
-	refreshRaw, err := newRefreshToken(64) // 64 bytes -> длинная строка
+	refreshRaw, err := newRefreshToken(64)
 	if err != nil {
-		a.log.Error("error with generate refresh token", sl.Err(err))
-		return "", "", fmt.Errorf("%s %w", op, err)
+		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
 	refreshHash := sha256Hex(refreshRaw)
 	refreshExp := time.Now().Add(a.refreshTTL)
 
-	if err := a.refreshSaver.SaveRefreshSession(ctx, user.ID, refreshHash, refreshExp); err != nil {
-		a.log.Error("failed to save refresh session", sl.Err(err))
-		return "", "", fmt.Errorf("%s %w", op, err)
+	if err := a.refreshSaver.SaveRefreshSession(ctx, user.UUID, refreshHash, refreshExp); err != nil {
+		a.log.Error("save refresh failed", sl.Err(err))
+		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
-	return refreshRaw, tokenAccess, nil
+	return refreshRaw, access, nil
 }
 
-// RegisterNewUser registers new user in the system and return ID.
-// if user with given username already exists, return error
-func (a *Auth) RegisterNewUser(
+func (a *Auth) IsAdminByUUID(
 	ctx context.Context,
-	email string,
-	password string,
-) (int64, error) {
+	userUUID uuid.UUID,
+) (bool, error) {
+	const op = "auth.IsAdminByUUID"
+
+	if userUUID == uuid.Nil {
+		return false, storage.ErrUserNotFound
+	}
+
+	isAdmin, err := a.userProvider.IsAdminByUUID(ctx, userUUID)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return isAdmin, nil
+}
+
+func (a *Auth) RegisterNewUser(ctx context.Context, email, password string) (uuid.UUID, error) {
 	const op = "auth.RegisterNewUser"
 
-	log := a.log.With(
-		slog.String("op", op),
-		slog.String("email", email), // так себе практика
-	)
-	log.Info("register user")
-
 	passHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-
 	if err != nil {
-		log.Error("failed to generate password hash", sl.Err(err))
-
-		return 0, fmt.Errorf("%s %w", op, err)
+		return uuid.Nil, fmt.Errorf("%s: %w", op, err)
 	}
 
-	id, err := a.userSaver.SaveUser(ctx, email, passHash)
+	userUUID, err := a.userSaver.SaveUser(ctx, email, email, passHash)
 	if err != nil {
 		if errors.Is(err, storage.ErrUserExist) {
-			// если пользователь уже существует
-			a.log.Warn("user already exists", sl.Err(err))
-			return 0, fmt.Errorf("%s %w", op, ErrUserExist)
+			return uuid.Nil, fmt.Errorf("%s: %w", op, storage.ErrUserExist)
 		}
-		log.Error("failed to save user", sl.Err(err))
-		return 0, fmt.Errorf("%s %w", op, err)
+		return uuid.Nil, fmt.Errorf("%s: %w", op, err)
 	}
 
-	log.Info("user registered")
-	return id, nil
+	return userUUID, nil
 }
 
-// is admin checks if user is admin
-func (a *Auth) IsAdmin(ctx context.Context, userID int64) (bool, error) {
-	const op = "Auth.IsAdmin"
-
-	log := a.log.With(
-		slog.String("op", op),
-		slog.Int64("user_id", userID),
-	)
-
-	log.Info("checking if user is admin")
-	isAsdmin, err := a.userProvider.IsAdmin(ctx, userID)
+func (a *Auth) ValidateToken(ctx context.Context, token string, appID int64) (uuid.UUID, error) {
+	userUUID, err := a.tokenManager.ParseToken(token, appID)
 	if err != nil {
-		if errors.Is(err, storage.ErrUserNotFound) {
-			// если человек ввел логин неверный или пароль
-			a.log.Warn("user not found", sl.Err(err))
-			return false, fmt.Errorf("%s %w", op, ErrUserNotFound)
-		}
-		return false, fmt.Errorf("%s %w", op, err)
+		return uuid.Nil, storage.ErrInvalidToken
 	}
 
-	log.Info("checking if user is admin", slog.Bool("isAdmin", isAsdmin))
+	user, err := a.userProvider.UserByUUID(ctx, userUUID)
+	if err != nil || !user.IsActive {
+		return uuid.Nil, storage.ErrUserNotFound
+	}
 
-	return isAsdmin, nil
+	return userUUID, nil
 }
 
-func (a *Auth) ValidateToken(ctx context.Context, token string, appID int64) (int64, error) {
-	userID, err := a.tokenManager.ParseToken(token, appID)
-	if err != nil {
-		return 0, ErrInvalidToken
+func (a *Auth) Refresh(ctx context.Context, refreshToken string, appID int) (accessToken, RefreshToken string, err error) {
+	const op = "auth.Refresh"
+
+	if refreshToken == "" {
+		return "", "", storage.ErrInvalidToken
 	}
 
-	// Проверяем что пользователь существует
-	_, err = a.userProvider.UserByID(ctx, userID)
-	if err != nil {
-		return 0, ErrUserNotFound
+	oldHash := sha256Hex(refreshToken)
+
+	sess, err := a.refreshProvider.RefreshSessionByHash(ctx, oldHash)
+	if err != nil || sess.RevokedAt != nil || time.Now().After(sess.ExpiresAt) {
+		return "", "", storage.ErrInvalidToken
 	}
 
-	return userID, nil
+	app, err := a.appProvider.App(ctx, int64(appID))
+	if err != nil {
+		return "", "", fmt.Errorf("%s: %w", op, err)
+	}
+
+	user, err := a.userProvider.UserByUUID(ctx, sess.UserUUID)
+	if err != nil {
+		return "", "", storage.ErrUserNotFound
+	}
+
+	access, err := jwt.NewToken(user, app, a.tokenTTL)
+	if err != nil {
+		return "", "", fmt.Errorf("%s: %w", op, err)
+	}
+
+	refreshRaw, err := newRefreshToken(64)
+	if err != nil {
+		return "", "", fmt.Errorf("%s: %w", op, err)
+	}
+
+	newHash := sha256Hex(refreshRaw)
+	newExp := time.Now().Add(a.refreshTTL)
+
+	if err := a.refreshRotator.RotateRefreshSession(ctx, oldHash, newHash, newExp); err != nil {
+		return "", "", fmt.Errorf("%s: %w", op, err)
+	}
+
+	return access, refreshRaw, nil
+}
+
+func (a *Auth) Logout(ctx context.Context, refreshToken string) error {
+	if refreshToken == "" {
+		return storage.ErrInvalidToken
+	}
+
+	hash := sha256Hex(refreshToken)
+	_ = a.refreshRevoker.RevokeRefreshSession(ctx, hash)
+
+	return nil
 }
