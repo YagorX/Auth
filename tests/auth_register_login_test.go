@@ -21,10 +21,12 @@ func TestRegisterLogin_Login_HappyPath(t *testing.T) {
 
 	email := gofakeit.Email()
 	pass := randomFakePassword()
+	username := randomFakePassword()
 
 	respReg, err := st.AuthClient.Register(ctx, &ssov1.RegisterRequest{
 		Email:    email,
 		Password: pass,
+		Username: username,
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, respReg.GetUserUuid())
@@ -32,9 +34,10 @@ func TestRegisterLogin_Login_HappyPath(t *testing.T) {
 	loginTime := time.Now()
 
 	respLogin, err := st.AuthClient.Login(ctx, &ssov1.LoginRequest{
-		Email:    email,
-		Password: pass,
-		AppId:    int32(st.AppID),
+		EmailOrName: username,
+		Password:    pass,
+		AppId:       int32(st.AppID),
+		DeviceId:    st.DeviceID,
 	})
 	if err != nil {
 		if s, ok := status.FromError(err); ok {
@@ -47,7 +50,6 @@ func TestRegisterLogin_Login_HappyPath(t *testing.T) {
 	require.NotEmpty(t, token)
 
 	parsed, err := jwt.Parse(token, func(tk *jwt.Token) (interface{}, error) {
-		// Если у тебя HMAC — проверяем метод подписи
 		if _, ok := tk.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, jwt.ErrSignatureInvalid
 		}
@@ -59,10 +61,10 @@ func TestRegisterLogin_Login_HappyPath(t *testing.T) {
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	require.True(t, ok)
 
-	// uid у тебя почти наверняка строка uuid
-	uid, ok := claims["uid"].(string)
-	require.True(t, ok, "uid claim should be string uuid")
-	assert.Equal(t, respReg.GetUserUuid(), uid)
+	// ✅ твой jwt.NewToken кладёт UUID в "sub"
+	sub, ok := claims["sub"].(string)
+	require.True(t, ok, "sub claim should be string uuid")
+	assert.Equal(t, respReg.GetUserUuid(), sub)
 
 	assert.Equal(t, email, claims["email"].(string))
 	assert.Equal(t, int(st.AppID), int(claims["app_id"].(float64)))
@@ -73,6 +75,167 @@ func TestRegisterLogin_Login_HappyPath(t *testing.T) {
 		claims["exp"].(float64),
 		deltaSeconds,
 	)
+}
+
+func TestRegisterLogin_DuplicatedRegistration(t *testing.T) {
+	ctx, st := suite.New(t)
+
+	email := gofakeit.Email()
+	username := randomFakePassword()
+	pass := randomFakePassword()
+
+	respReg, err := st.AuthClient.Register(ctx, &ssov1.RegisterRequest{
+		Username: username,
+		Email:    email,
+		Password: pass,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, respReg.GetUserUuid())
+
+	_, err = st.AuthClient.Register(ctx, &ssov1.RegisterRequest{
+		Username: username,
+		Email:    email,
+		Password: pass,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "user already exists")
+}
+
+func TestRegister_FailCases(t *testing.T) {
+	ctx, st := suite.New(t)
+
+	tests := []struct {
+		name        string
+		email       string
+		password    string
+		expectedErr string
+	}{
+		{
+			name:        "Register with Empty Password",
+			email:       gofakeit.Email(),
+			password:    "",
+			expectedErr: "password is required",
+		},
+		{
+			name:        "Register with Empty Email",
+			email:       "",
+			password:    randomFakePassword(),
+			expectedErr: "email is required",
+		},
+		{
+			name:        "Register with Both Empty",
+			email:       "",
+			password:    "",
+			expectedErr: "email is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := st.AuthClient.Register(ctx, &ssov1.RegisterRequest{
+				Username: tt.name,
+				Email:    tt.email,
+				Password: tt.password,
+			})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.expectedErr)
+		})
+	}
+}
+
+func TestLogin_FailCases(t *testing.T) {
+	ctx, st := suite.New(t)
+
+	tests := []struct {
+		name        string
+		email       string
+		password    string
+		appID       int32
+		deviceID    string
+		expectedErr string
+	}{
+		{
+			name:        "Login with Empty Password",
+			email:       gofakeit.Email(),
+			password:    "",
+			appID:       int32(st.AppID),
+			deviceID:    st.DeviceID,
+			expectedErr: "password is required",
+		},
+		{
+			name:        "Login with Empty Email",
+			email:       "",
+			password:    randomFakePassword(),
+			appID:       int32(st.AppID),
+			deviceID:    st.DeviceID,
+			expectedErr: "email is required",
+		},
+		{
+			name:        "Login with Both Empty Email and Password",
+			email:       "",
+			password:    "",
+			appID:       int32(st.AppID),
+			deviceID:    st.DeviceID,
+			expectedErr: "email is required",
+		},
+		{
+			name:        "Login with Non-Matching Password",
+			email:       gofakeit.Email(),
+			password:    randomFakePassword(),
+			appID:       int32(st.AppID),
+			deviceID:    st.DeviceID,
+			expectedErr: "invalid email or password",
+		},
+		{
+			name:        "Login without AppID",
+			email:       gofakeit.Email(),
+			password:    randomFakePassword(),
+			appID:       0,
+			deviceID:    st.DeviceID,
+			expectedErr: "app_id is required",
+		},
+		{
+			name:        "Login without DeviceID",
+			email:       gofakeit.Email(),
+			password:    randomFakePassword(),
+			appID:       int32(st.AppID),
+			deviceID:    "",
+			expectedErr: "device_id is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// регаем пользователя только для кейсов "non-matching password" и "happy login",
+			// но не мешает делать всегда — email/password случайные
+			email := gofakeit.Email()
+			pass := randomFakePassword()
+
+			_, err := st.AuthClient.Register(ctx, &ssov1.RegisterRequest{
+				Username: gofakeit.UUID(),
+				Email:    email,
+				Password: pass,
+			})
+			require.NoError(t, err)
+
+			// если кейс про “non-matching password” — используем зарегистрированный email, но другой пароль
+			loginEmail := tt.email
+			loginPass := tt.password
+			if tt.name == "Login with Non-Matching Password" {
+				loginEmail = email
+				loginPass = randomFakePassword()
+			}
+
+			_, err = st.AuthClient.Login(ctx, &ssov1.LoginRequest{
+				EmailOrName: loginEmail,
+				Password:    loginPass,
+				AppId:       tt.appID,
+				DeviceId:    tt.deviceID,
+			})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.expectedErr)
+		})
+	}
 }
 
 func randomFakePassword() string {

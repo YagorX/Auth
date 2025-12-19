@@ -86,3 +86,35 @@ CREATE TABLE IF NOT EXISTS system_metrics (
 
 CREATE INDEX IF NOT EXISTS idx_metrics_name ON system_metrics(metric_name);
 CREATE INDEX IF NOT EXISTS idx_metrics_created_at ON system_metrics(created_at);
+
+-- APPS (clients)
+CREATE TABLE IF NOT EXISTS apps (
+  id         BIGSERIAL PRIMARY KEY,
+  name       VARCHAR(100) NOT NULL UNIQUE,
+  secret     TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trg_apps_set_updated_at ON apps;
+CREATE TRIGGER trg_apps_set_updated_at
+BEFORE UPDATE ON apps
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+
+CREATE INDEX IF NOT EXISTS idx_apps_name ON apps(name);
+
+INSERT INTO roles (name, description)
+VALUES
+  ('user',  'default user role'),
+  ('admin', 'administrator role')
+ON CONFLICT (name) DO NOTHING;
+
+-- Seed default applications (clients)
+
+INSERT INTO apps (id, name, secret)
+VALUES
+  (1, 'web-client',    'web-secret'),
+  (2, 'mobile-client', 'mobile-secret'),
+  (100, 'test-app',    'test-secret')
+ON CONFLICT (id) DO NOTHING;

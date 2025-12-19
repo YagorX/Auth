@@ -50,19 +50,19 @@ type AppProvider interface {
 }
 
 type RefreshSessionSaver interface {
-	SaveRefreshSession(ctx context.Context, userUUID uuid.UUID, refreshHash string, expiresAt time.Time) error
+	SaveRefreshSession(ctx context.Context, userUUID uuid.UUID, refreshHash string, expiresAt time.Time, ip, userAgent, deviceID string, appID int64) error
 }
 
 type RefreshSessionProvider interface {
-	RefreshSessionByHash(ctx context.Context, hash string) (models.RefreshSession, error)
+	RefreshSessionByHash(ctx context.Context, hash string, deviceID string, appID int64) (models.RefreshSession, error)
 }
 
 type RefreshSessionRotator interface {
-	RotateRefreshSession(ctx context.Context, oldHash, newHash string, newExpiresAt time.Time) error
+	RotateRefreshSession(ctx context.Context, oldHash, newHash string, newExpiresAt time.Time, ip, userAgent, deviceID string, appID int64) error
 }
 
 type RefreshSessionRevoker interface {
-	RevokeRefreshSession(ctx context.Context, hash string) error
+	RevokeRefreshSession(ctx context.Context, hash string, deviceID string, appID int64) error
 }
 
 func New(
@@ -93,24 +93,29 @@ func New(
 	}
 }
 
-/*
-====================
-Auth methods
-====================
-*/
-
-func (a *Auth) Login(ctx context.Context, email, password string, appID int) (refreshToken, accessToken string, err error) {
+func (a *Auth) Login(ctx context.Context, emailorname, password string, appID int, deviceID, ip, userAgent string) (refreshToken, accessToken string, err error) {
 	const op = "auth.Login"
 
-	user, err := a.userProvider.User(ctx, email)
+	log := a.log.With(
+		slog.String("op", op),
+		slog.String("emailorname", emailorname),
+		// password либо не логируем, либо логируем в замаскированном виде
+	)
+
+	log.Info("attempting to login user")
+
+	user, err := a.userProvider.User(ctx, emailorname)
 	if err != nil {
 		if errors.Is(err, storage.ErrUserNotFound) {
+			a.log.Warn("user not found", sl.Err(err))
 			return "", "", fmt.Errorf("%s: %w", op, storage.ErrInvalidCredentials)
 		}
+		a.log.Error("failed to get user", sl.Err(err))
 		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
 	if err := bcrypt.CompareHashAndPassword(user.PasswordHash, []byte(password)); err != nil {
+		a.log.Info("invalid credentials")
 		return "", "", fmt.Errorf("%s: %w", op, storage.ErrInvalidCredentials)
 	}
 
@@ -119,20 +124,24 @@ func (a *Auth) Login(ctx context.Context, email, password string, appID int) (re
 		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
+	log.Info("user logged in successfully")
+
 	access, err := jwt.NewToken(user, app, a.tokenTTL)
 	if err != nil {
+		a.log.Error("failed to generate access token", sl.Err(err))
 		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
 	refreshRaw, err := newRefreshToken(64)
 	if err != nil {
+		a.log.Error("failed to generate refresh token", sl.Err(err))
 		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
 	refreshHash := sha256Hex(refreshRaw)
 	refreshExp := time.Now().Add(a.refreshTTL)
 
-	if err := a.refreshSaver.SaveRefreshSession(ctx, user.UUID, refreshHash, refreshExp); err != nil {
+	if err := a.refreshSaver.SaveRefreshSession(ctx, user.UUID, refreshHash, refreshExp, ip, userAgent, deviceID, int64(appID)); err != nil {
 		a.log.Error("save refresh failed", sl.Err(err))
 		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
@@ -140,11 +149,44 @@ func (a *Auth) Login(ctx context.Context, email, password string, appID int) (re
 	return refreshRaw, access, nil
 }
 
-func (a *Auth) IsAdminByUUID(
-	ctx context.Context,
-	userUUID uuid.UUID,
-) (bool, error) {
+func (a *Auth) RegisterNewUser(ctx context.Context, username, email, password string) (uuid.UUID, error) {
+	const op = "auth.RegisterNewUser"
+
+	log := a.log.With(
+		slog.String("op", op),
+		slog.String("email", email),
+		slog.String("username", username),
+	)
+
+	log.Info("registering user")
+
+	passHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Error("failed to generate password hash", sl.Err(err))
+		return uuid.Nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	userUUID, err := a.userSaver.SaveUser(ctx, username, email, passHash)
+	if err != nil {
+		log.Error("failed to save user", sl.Err(err))
+		if errors.Is(err, storage.ErrUserExist) {
+			return uuid.Nil, fmt.Errorf("%s: %w", op, storage.ErrUserExist)
+		}
+		return uuid.Nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return userUUID, nil
+}
+
+func (a *Auth) IsAdminByUUID(ctx context.Context, userUUID uuid.UUID) (bool, error) {
 	const op = "auth.IsAdminByUUID"
+
+	log := a.log.With(
+		slog.String("op", op),
+		slog.String("userUUID", userUUID.String()),
+	)
+
+	log.Info("checking if user is admin")
 
 	if userUUID == uuid.Nil {
 		return false, storage.ErrUserNotFound
@@ -155,33 +197,23 @@ func (a *Auth) IsAdminByUUID(
 		return false, fmt.Errorf("%s: %w", op, err)
 	}
 
+	log.Info("checked if user is admin", slog.Bool("is_admin", isAdmin))
+
 	return isAdmin, nil
 }
 
-func (a *Auth) RegisterNewUser(ctx context.Context, email, password string) (uuid.UUID, error) {
-	const op = "auth.RegisterNewUser"
-
-	passHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	userUUID, err := a.userSaver.SaveUser(ctx, email, email, passHash)
-	if err != nil {
-		if errors.Is(err, storage.ErrUserExist) {
-			return uuid.Nil, fmt.Errorf("%s: %w", op, storage.ErrUserExist)
-		}
-		return uuid.Nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	return userUUID, nil
-}
-
 func (a *Auth) ValidateToken(ctx context.Context, token string, appID int64) (uuid.UUID, error) {
+	const op = "auth.ValidateToken"
 	userUUID, err := a.tokenManager.ParseToken(token, appID)
 	if err != nil {
 		return uuid.Nil, storage.ErrInvalidToken
 	}
+
+	log := a.log.With(
+		slog.String("op", op),
+	)
+
+	log.Info("checking token")
 
 	user, err := a.userProvider.UserByUUID(ctx, userUUID)
 	if err != nil || !user.IsActive {
@@ -191,16 +223,22 @@ func (a *Auth) ValidateToken(ctx context.Context, token string, appID int64) (uu
 	return userUUID, nil
 }
 
-func (a *Auth) Refresh(ctx context.Context, refreshToken string, appID int) (accessToken, RefreshToken string, err error) {
+func (a *Auth) Refresh(ctx context.Context, refreshToken string, appID int, deviceID, ip, userAgent string) (accessToken, RefreshToken string, err error) {
 	const op = "auth.Refresh"
 
 	if refreshToken == "" {
 		return "", "", storage.ErrInvalidToken
 	}
 
+	log := a.log.With(
+		slog.String("op", op),
+	)
+
+	log.Info("refresh tokens")
+
 	oldHash := sha256Hex(refreshToken)
 
-	sess, err := a.refreshProvider.RefreshSessionByHash(ctx, oldHash)
+	sess, err := a.refreshProvider.RefreshSessionByHash(ctx, oldHash, deviceID, int64(appID))
 	if err != nil || sess.RevokedAt != nil || time.Now().After(sess.ExpiresAt) {
 		return "", "", storage.ErrInvalidToken
 	}
@@ -228,20 +266,28 @@ func (a *Auth) Refresh(ctx context.Context, refreshToken string, appID int) (acc
 	newHash := sha256Hex(refreshRaw)
 	newExp := time.Now().Add(a.refreshTTL)
 
-	if err := a.refreshRotator.RotateRefreshSession(ctx, oldHash, newHash, newExp); err != nil {
+	if err := a.refreshRotator.RotateRefreshSession(ctx, oldHash, newHash, newExp, ip, userAgent, deviceID, int64(appID)); err != nil {
 		return "", "", fmt.Errorf("%s: %w", op, err)
 	}
 
 	return access, refreshRaw, nil
 }
 
-func (a *Auth) Logout(ctx context.Context, refreshToken string) error {
+func (a *Auth) Logout(ctx context.Context, refreshToken string, appID int64, deviceID string) error {
+	const op = "auth.Logout"
+
+	log := a.log.With(
+		slog.String("op", op),
+	)
+
+	log.Info("logout")
+
 	if refreshToken == "" {
 		return storage.ErrInvalidToken
 	}
 
 	hash := sha256Hex(refreshToken)
-	_ = a.refreshRevoker.RevokeRefreshSession(ctx, hash)
+	_ = a.refreshRevoker.RevokeRefreshSession(ctx, hash, deviceID, appID)
 
 	return nil
 }

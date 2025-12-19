@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,15 +38,19 @@ func New(dsn string, log *slog.Logger) (*Storage, error) {
 
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return true
+	}
+	// fallback: когда ошибка обёрнута так, что PgError не достаётся
+	return strings.Contains(err.Error(), "SQLSTATE 23505")
 }
 
 func (s *Storage) SaveUser(ctx context.Context, username, email string, passHash []byte) (uuid.UUID, error) {
 	const op = "storage.postgres.SaveUser"
 
 	query := `
-		INSERT INTO users (username, email, password_hash)
-		VALUES ($1, $2, $3)
+		INSERT INTO users (username, email, password_hash, role_id)
+		VALUES ($1, $2, $3, (SELECT id FROM roles WHERE name = 'user'))
 		RETURNING uuid
 	`
 
@@ -67,7 +72,7 @@ func (s *Storage) User(ctx context.Context, email string) (models.User, error) {
 	q := `
 		SELECT id, uuid, username, email, password_hash, role_id, is_active
 		FROM users
-		WHERE email = $1
+		WHERE email = $1 or username = $1
 		LIMIT 1
 	`
 
@@ -231,15 +236,25 @@ func (s *Storage) App(ctx context.Context, appID int64) (models.App, error) {
 	return app, nil
 }
 
-func (s *Storage) SaveRefreshSession(ctx context.Context, userUUID uuid.UUID, refreshHash string, expiresAt time.Time) error {
+func (s *Storage) SaveRefreshSession(
+	ctx context.Context,
+	userUUID uuid.UUID,
+	refreshHash string,
+	expiresAt time.Time,
+	ip string,
+	userAgent string,
+	deviceID string,
+	appID int64,
+) error {
 	const op = "storage.postgres.SaveRefreshSession"
 
 	q := `
-		INSERT INTO user_sessions (user_uuid, refresh_token_hash, expires_at)
-		VALUES ($1, $2, $3)
+		INSERT INTO user_sessions
+			(user_uuid, refresh_token_hash, expires_at, ip_address, user_agent, device_id, app_id)
+		VALUES ($1, $2, $3, NULLIF($4,'' )::inet, NULLIF($5,''), NULLIF($6,''), $7)
 	`
 
-	_, err := s.db.ExecContext(ctx, q, userUUID, refreshHash, expiresAt)
+	_, err := s.db.ExecContext(ctx, q, userUUID, refreshHash, expiresAt, ip, userAgent, deviceID, appID)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%s: %w", op, storage.ErrRefreshSessionExists)
@@ -250,13 +265,16 @@ func (s *Storage) SaveRefreshSession(ctx context.Context, userUUID uuid.UUID, re
 	return nil
 }
 
-func (s *Storage) RefreshSessionByHash(ctx context.Context, hash string) (models.RefreshSession, error) {
+func (s *Storage) RefreshSessionByHash(ctx context.Context, hash string, deviceID string, appID int64) (models.RefreshSession, error) {
 	const op = "storage.postgres.RefreshSessionByHash"
 
 	q := `
-		SELECT id, user_uuid, refresh_token_hash, expires_at, created_at, revoked_at, replaced_by_hash
+		SELECT id, user_uuid, refresh_token_hash, expires_at, created_at, revoked_at, replaced_by_hash,
+		       ip_address, user_agent, device_id, app_id
 		FROM user_sessions
 		WHERE refresh_token_hash = $1
+		  AND device_id = $2
+		  AND app_id = $3
 		LIMIT 1
 	`
 
@@ -264,7 +282,13 @@ func (s *Storage) RefreshSessionByHash(ctx context.Context, hash string) (models
 	var revokedAt sql.NullTime
 	var replaced sql.NullString
 
-	err := s.db.QueryRowContext(ctx, q, hash).Scan(
+	// если у тебя в модели есть эти поля — заполни; если нет, можно не сканить ip/ua/device/app
+	var ip sql.NullString
+	var ua sql.NullString
+	var dev sql.NullString
+	var app sql.NullInt64
+
+	err := s.db.QueryRowContext(ctx, q, hash, deviceID, appID).Scan(
 		&sess.ID,
 		&sess.UserUUID,
 		&sess.RefreshTokenHash,
@@ -272,6 +296,7 @@ func (s *Storage) RefreshSessionByHash(ctx context.Context, hash string) (models
 		&sess.CreatedAt,
 		&revokedAt,
 		&replaced,
+		&ip, &ua, &dev, &app,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -289,10 +314,20 @@ func (s *Storage) RefreshSessionByHash(ctx context.Context, hash string) (models
 		sess.ReplacedByHash = &v
 	}
 
+	// опционально, если поля есть в модели:
+	// if ip.Valid { sess.IPAddress = &ip.String } ...
 	return sess, nil
 }
 
-func (s *Storage) RotateRefreshSession(ctx context.Context, oldHash, newHash string, newExpiresAt time.Time) error {
+func (s *Storage) RotateRefreshSession(
+	ctx context.Context,
+	oldHash, newHash string,
+	newExpiresAt time.Time,
+	ip string,
+	userAgent string,
+	deviceID string,
+	appID int64,
+) error {
 	const op = "storage.postgres.RotateRefreshSession"
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -301,7 +336,7 @@ func (s *Storage) RotateRefreshSession(ctx context.Context, oldHash, newHash str
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 1) читаем старую сессию
+	// читаем старую сессию строго по (hash + device + app)
 	var userUUID uuid.UUID
 	var expiresAt time.Time
 	var revokedAt sql.NullTime
@@ -310,8 +345,10 @@ func (s *Storage) RotateRefreshSession(ctx context.Context, oldHash, newHash str
 		SELECT user_uuid, expires_at, revoked_at
 		FROM user_sessions
 		WHERE refresh_token_hash = $1
+		  AND device_id = $2
+		  AND app_id = $3
 		LIMIT 1
-	`, oldHash).Scan(&userUUID, &expiresAt, &revokedAt)
+	`, oldHash, deviceID, appID).Scan(&userUUID, &expiresAt, &revokedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%s: %w", op, storage.ErrRefreshSessionNotFound)
@@ -323,11 +360,12 @@ func (s *Storage) RotateRefreshSession(ctx context.Context, oldHash, newHash str
 		return fmt.Errorf("%s: %w", op, storage.ErrRefreshSessionNotFound)
 	}
 
-	// 2) вставляем новую
+	// вставляем новую (поля берём из текущего запроса)
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO user_sessions (user_uuid, refresh_token_hash, expires_at)
-		VALUES ($1, $2, $3)
-	`, userUUID, newHash, newExpiresAt)
+		INSERT INTO user_sessions
+			(user_uuid, refresh_token_hash, expires_at, ip_address, user_agent, device_id, app_id)
+		VALUES ($1, $2, $3, NULLIF($4,'' )::inet, NULLIF($5,''), $6, $7)
+	`, userUUID, newHash, newExpiresAt, ip, userAgent, deviceID, appID)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%s: %w", op, storage.ErrRefreshSessionExists)
@@ -335,12 +373,15 @@ func (s *Storage) RotateRefreshSession(ctx context.Context, oldHash, newHash str
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	// 3) ревокаем старую
+	// ревокаем старую и ставим replaced_by_hash
 	res, err := tx.ExecContext(ctx, `
 		UPDATE user_sessions
 		SET revoked_at = NOW(), replaced_by_hash = $2
-		WHERE refresh_token_hash = $1 AND revoked_at IS NULL
-	`, oldHash, newHash)
+		WHERE refresh_token_hash = $1
+		  AND device_id = $3
+		  AND app_id = $4
+		  AND revoked_at IS NULL
+	`, oldHash, newHash, deviceID, appID)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -357,14 +398,17 @@ func (s *Storage) RotateRefreshSession(ctx context.Context, oldHash, newHash str
 	return nil
 }
 
-func (s *Storage) RevokeRefreshSession(ctx context.Context, hash string) error {
+func (s *Storage) RevokeRefreshSession(ctx context.Context, hash string, deviceID string, appID int64) error {
 	const op = "storage.postgres.RevokeRefreshSession"
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE user_sessions
 		SET revoked_at = NOW()
-		WHERE refresh_token_hash = $1 AND revoked_at IS NULL
-	`, hash)
+		WHERE refresh_token_hash = $1
+		  AND device_id = $2
+		  AND app_id = $3
+		  AND revoked_at IS NULL
+	`, hash, deviceID, appID)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
