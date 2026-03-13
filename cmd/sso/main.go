@@ -30,7 +30,6 @@ func main() {
 	// TODO: инициализировать приложение (app)
 
 	application := app.New(log, cfg.GRPC.Port, cfg.PostgresDSN, cfg.TokenTTL, cfg.RefreshTTL)
-
 	log.Info("staritng application", slog.Any("config", cfg))
 
 	go application.GRPCServer.MustRun()
